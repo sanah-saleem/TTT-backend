@@ -1,0 +1,37 @@
+# MSYS_NO_PATHCONV=1 docker exec -it cockroach /cockroach/cockroach sql --insecure --host=cockroach -e "CREATE DATABASE IF NOT EXISTS nakama;"
+
+
+services:
+  nakama:
+    image: heroiclabs/nakama:3.21.0
+    container_name: nakama
+    restart: always
+    depends_on:
+      - cockroach
+    ports:
+      - "7350:7350"
+      - "7351:7351"
+    volumes:
+      - ./data:/data
+      - ./modules:/nakama/modules
+    command:
+      - -name=nakama1
+      - -socket.server_key=defaultkey
+      - -database.address=root@cockroach:26257/nakama?sslmode=disable
+      - -runtime.path=/nakama/modules
+      - -session.token_expiry_sec=7200
+      - -socket.read_timeout_ms=60000
+      - -socket.write_timeout_ms=60000
+
+
+  cockroach:
+    image: cockroachdb/cockroach:v24.1.0
+    container_name: cockroach
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+      - "8080:8080"
+    volumes:
+      - ./cockroach-data:/cockroach/cockroach-data
+
+  

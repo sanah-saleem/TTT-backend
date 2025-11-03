@@ -1,0 +1,11 @@
+.env
+cockroach-data/
+crdb-data/
+*.sql.log
+*.log
+*.tmp
+temp/
+/cache/
+.vscode/
+.idea/
+*.iml
