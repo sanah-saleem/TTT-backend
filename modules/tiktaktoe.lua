@@ -9,6 +9,7 @@ local TTT_MATCH_NAME = "tik-tak-toe"
 local OP_MOVE = 1 
 local OP_STATE = 2 
 local OP_ERROR = 3 
+local OP_RESTART = 4
 
 local function check_win(board) 
     local win_positions = {
@@ -130,6 +131,9 @@ function M.match_leave(context, dispatcher, tick, state, presences)
         state.players_by_id[presence.user_id] = nil 
         state.symbols[presence.user_id] = nil 
     end 
+    if state.status == "ended" then
+        state.turn = nil
+    end 
     broadcast_state(dispatcher, state) 
     return state 
 end 
@@ -180,11 +184,33 @@ local function processMove(message, dispatcher, state)
     broadcast_state(dispatcher, state)
 end
 
+local function reset_game(state) 
+    state.board = {"","","","","","","","",""}
+    state.status = "playing"
+    state.winner = nil
+    -- alternate who starts this round:
+    if state.players[1] and state.players[2] then
+        if state.turn == state.players[1].user_id then
+            state.turn = state.players[2].user_id
+        else
+            state.turn = state.players[1].user_id
+        end
+    end
+end
 
 function M.match_loop(context, dispatcher, tick, state, messages) 
     for _, message in ipairs(messages) do 
         if message.op_code == OP_MOVE and state.status == "playing" then 
             processMove(message, dispatcher, state) 
+        elseif message.op_code == OP_RESTART and state.status == "ended" then
+            --only current players can restart
+            local pid = message.sender.user_id
+            if state.symbols[pid] then
+                reset_game(state)
+                broadcast_state(dispatcher, state)
+            else
+                dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg="Not a player in this match"}), {message.sender})
+            end
         end 
     end 
     return state 
