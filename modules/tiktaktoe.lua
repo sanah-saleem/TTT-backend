@@ -107,9 +107,8 @@ end
 
 function M.match_join(context, dispatcher, tick, state, presences) 
     for _, presence in ipairs(presences) do 
-        if not presence or presence.user_id then
+        if not presence or not presence.user_id then
             nk.logger_warn("Invalid presence during join attempt")
-            return state, false, "invalid presence"
         end
 
         if not state.players_by_id[presence.user_id] then 
@@ -245,6 +244,7 @@ function M.match_loop(context, dispatcher, tick, state, messages)
         elseif message.op_code == OP_RESTART and state.status == STATUS_ENDED then
             if #state.players < 2 then 
                 broadcast_error(dispatcher, "Cannot restart without both players", {message.sender})
+                return state
             end
             --only current players can restart
             local pid = message.sender.user_id
