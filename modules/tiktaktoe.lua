@@ -11,6 +11,10 @@ local OP_STATE = 2
 local OP_ERROR = 3 
 local OP_RESTART = 4
 
+local STATUS_WAITING = "waiting"
+local STATUS_PLAYING = "playing"
+local STATUS_ENDED   = "ended"
+
 local function check_win(board) 
     local win_positions = {
         {1,2,3},{4,5,6},{7,8,9}, -- rows 
@@ -52,6 +56,11 @@ local function broadcast_state(dispatcher, state)
     dispatcher.broadcast_message(OP_STATE, snapshot(state)) 
 end 
 
+local function broadcast_error(dispatcher, msg, recipients)
+    recipients = recipients or nil  -- nil = broadcast to all
+    dispatcher.broadcast_message(OP_ERROR, nk.json_encode({ msg = msg }), recipients)
+end
+
 local TURN_MS = 15000 -- 15 secs per turn
 
 local function other_player_id(state, pid)
@@ -69,7 +78,7 @@ function M.match_init(context, params)
         players_by_id = {}, -- players in the order of id 
         symbols = {}, 
         turn = nil, 
-        status = "waiting", 
+        status = STATUS_WAITING, 
         winner = nil,
         turn_deadline_ms = nil, } 
     local tick_rate = 2 
@@ -98,12 +107,17 @@ end
 
 function M.match_join(context, dispatcher, tick, state, presences) 
     for _, presence in ipairs(presences) do 
+        if not presence or presence.user_id then
+            nk.logger_warn("Invalid presence during join attempt")
+            return state, false, "invalid presence"
+        end
+
         if not state.players_by_id[presence.user_id] then 
             table.insert(state.players, presence) 
             state.players_by_id[presence.user_id] = presence 
         end 
     end 
-    if #state.players == 2 and state.status == "waiting" then 
+    if #state.players == 2 and state.status == STATUS_WAITING then 
         -- initilize a fresh board and assign symbols based on join order. 
         state.board = {"","","","","","","","",""} 
         local p1 = state.players[1].user_id 
@@ -111,7 +125,7 @@ function M.match_join(context, dispatcher, tick, state, presences)
         state.symbols[p1] = "X" 
         state.symbols[p2] = "O" 
         state.turn = p1 
-        state.status = "playing"
+        state.status = STATUS_PLAYING
         state.turn_deadline_ms = nk.time() + TURN_MS 
     end 
     broadcast_state(dispatcher, state) 
@@ -131,17 +145,18 @@ function M.match_leave(context, dispatcher, tick, state, presences)
         end 
     end 
     state.players = remaining 
-    if state.status == "playing" and #state.players == 1 then 
-        state.status = "ended" 
+    if state.status == STATUS_PLAYING and #state.players == 1 then 
+        state.status = STATUS_ENDED 
         state.winner = state.players[1].user_id
     elseif #state.players == 0 then 
-        state.status = "ended" 
+        state.status = STATUS_ENDED 
+        state.winner = nil
     end 
     for _, presence in ipairs(presences) do 
         state.players_by_id[presence.user_id] = nil 
         state.symbols[presence.user_id] = nil 
     end 
-    if state.status == "ended" then
+    if state.status == STATUS_ENDED then
         state.turn = nil
         state.turn_deadline_ms = nil
     end 
@@ -153,25 +168,25 @@ local function processMove(message, dispatcher, state)
     local player_id = message.sender.user_id 
 
     if player_id ~= state.turn then 
-        dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg = "Not your turn"}), {message.sender}) 
+        broadcast_error(dispatcher, "Not your turn", {message.sender})
         return  
     end 
 
     --making sure player is actually one of the 2 added players 
     local symbol = state.symbols[player_id] 
     if not symbol then 
-        dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg="Not a player in this match"}), {message.sender}) 
+        broadcast_error(dispatcher, "Not a player in this match", {message.sender})
         return
     end
     local ok, move = pcall(nk.json_decode, message.data) 
     if not ok or type(move) ~= "table" or type(move.cell) ~= "number" then 
-        dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg="Bad payload"}), {message.sender}) 
+        broadcast_error(dispatcher, "Bad payload", {message.sender})
         return
     end 
     
     local cell = move.cell 
     if cell < 1 or cell > 9 or state.board[cell] ~= "" then 
-        dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg="invalid cell"}), {message.sender}) 
+        broadcast_error(dispatcher, "invalid cell", {message.sender})
         return
     end 
     
@@ -179,10 +194,10 @@ local function processMove(message, dispatcher, state)
     
     local won, _ = check_win(state.board) 
     if won then 
-        state.status = "ended" 
+        state.status = STATUS_ENDED 
         state.winner = player_id 
     elseif check_draw(state.board) then 
-        state.status = "ended" 
+        state.status = STATUS_ENDED 
         state.winner = nil 
     else 
         -- switch turns 
@@ -198,7 +213,7 @@ end
 
 local function reset_game(state) 
     state.board = {"","","","","","","","",""}
-    state.status = "playing"
+    state.status = STATUS_PLAYING
     state.winner = nil
     -- alternate who starts this round:
     if state.players[1] and state.players[2] then
@@ -213,10 +228,10 @@ end
 
 function M.match_loop(context, dispatcher, tick, state, messages) 
     --enforce timer
-    if state.status == "playing" and state.turn and state.turn_deadline_ms then
+    if state.status == STATUS_PLAYING and state.turn and state.turn_deadline_ms then
         if nk.time() >= state.turn_deadline_ms then
             local winner = other_player_id(state, state.turn)
-            state.status = "ended"
+            state.status = STATUS_ENDED
             state.winner = winner
             state.turn = nil
             state.turn_deadline_ms = nil
@@ -225,23 +240,30 @@ function M.match_loop(context, dispatcher, tick, state, messages)
         end
     end
     for _, message in ipairs(messages) do 
-        if message.op_code == OP_MOVE and state.status == "playing" then 
+        if message.op_code == OP_MOVE and state.status == STATUS_PLAYING then 
             processMove(message, dispatcher, state) 
-        elseif message.op_code == OP_RESTART and state.status == "ended" then
+        elseif message.op_code == OP_RESTART and state.status == STATUS_ENDED then
+            if #state.players < 2 then 
+                broadcast_error(dispatcher, "Cannot restart without both players", {message.sender})
+            end
             --only current players can restart
             local pid = message.sender.user_id
             if state.symbols[pid] then
                 reset_game(state)
                 broadcast_state(dispatcher, state)
             else
-                dispatcher.broadcast_message(OP_ERROR, nk.json_encode({msg="Not a player in this match"}), {message.sender})
+                broadcast_error(dispatcher, "Not a player in this match", {message.sender})
             end
         end 
     end 
+    if state.status == STATUS_ENDED and #state.players == 0 then
+        nk.match_terminate(context.match_id)
+    end
     return state 
 end 
 
 function M.match_terminate(context, dispatcher, tick, state, grace_seconds) 
+    nk.logger_info(("Match %s terminated."):format(context.match_id))
     return nil 
 end
 
