@@ -44,12 +44,20 @@ local function snapshot(state)
         players = { state.players[1] and state.players[1].user_id or nil, 
                     state.players[2] and state.players[2].user_id or nil 
                 }, 
-        symbols = state.symbols }) 
+        symbols = state.symbols,
+        turnDeadlineMs = state.turn_deadline_ms, }) 
 end 
 
 local function broadcast_state(dispatcher, state) 
     dispatcher.broadcast_message(OP_STATE, snapshot(state)) 
 end 
+
+local TURN_MS = 15000 -- 15 secs per turn
+
+local function other_player_id(state, pid)
+    if not state.players[1] or not state.players[2] then return nil end
+    return (state.players[1].user_id == pid) and state.players[2].user_id or state.players[1].user_id
+end
 
 -- Module table to avoid forward-ref issues.
 local M = {}
@@ -62,7 +70,8 @@ function M.match_init(context, params)
         symbols = {}, 
         turn = nil, 
         status = "waiting", 
-        winner = nil } 
+        winner = nil,
+        turn_deadline_ms = nil, } 
     local tick_rate = 2 
     local label = nk.json_encode({
                         properties = { module = TTT_MATCH_MODULE },
@@ -102,7 +111,8 @@ function M.match_join(context, dispatcher, tick, state, presences)
         state.symbols[p1] = "X" 
         state.symbols[p2] = "O" 
         state.turn = p1 
-        state.status = "playing" 
+        state.status = "playing"
+        state.turn_deadline_ms = nk.time() + TURN_MS 
     end 
     broadcast_state(dispatcher, state) 
     return state 
@@ -133,6 +143,7 @@ function M.match_leave(context, dispatcher, tick, state, presences)
     end 
     if state.status == "ended" then
         state.turn = nil
+        state.turn_deadline_ms = nil
     end 
     broadcast_state(dispatcher, state) 
     return state 
@@ -180,6 +191,7 @@ local function processMove(message, dispatcher, state)
         else 
             state.turn = state.players[1].user_id 
         end 
+        state.turn_deadline_ms = nk.time() + TURN_MS
     end 
     broadcast_state(dispatcher, state)
 end
@@ -196,9 +208,22 @@ local function reset_game(state)
             state.turn = state.players[1].user_id
         end
     end
+    state.turn_deadline_ms = nk.time() + TURN_MS
 end
 
 function M.match_loop(context, dispatcher, tick, state, messages) 
+    --enforce timer
+    if state.status == "playing" and state.turn and state.turn_deadline_ms then
+        if nk.time() >= state.turn_deadline_ms then
+            local winner = other_player_id(state, state.turn)
+            state.status = "ended"
+            state.winner = winner
+            state.turn = nil
+            state.turn_deadline_ms = nil
+            broadcast_state(dispatcher, state)
+            return state
+        end
+    end
     for _, message in ipairs(messages) do 
         if message.op_code == OP_MOVE and state.status == "playing" then 
             processMove(message, dispatcher, state) 
