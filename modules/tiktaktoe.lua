@@ -15,6 +15,9 @@ local STATUS_WAITING = "waiting"
 local STATUS_PLAYING = "playing"
 local STATUS_ENDED   = "ended"
 
+local REJOIN_GRACE_MS = 20000
+local TURN_MS = 15000 -- 15 secs per turn
+
 local function check_win(board) 
     local win_positions = {
         {1,2,3},{4,5,6},{7,8,9}, -- rows 
@@ -61,8 +64,6 @@ local function broadcast_error(dispatcher, msg, recipients)
     dispatcher.broadcast_message(OP_ERROR, nk.json_encode({ msg = msg }), recipients)
 end
 
-local TURN_MS = 15000 -- 15 secs per turn
-
 local function other_player_id(state, pid)
     if not state.players[1] or not state.players[2] then return nil end
     return (state.players[1].user_id == pid) and state.players[2].user_id or state.players[1].user_id
@@ -74,13 +75,16 @@ local M = {}
 function M.match_init(context, params) 
     local state = { 
         board = {"","","","","","","","",""}, 
-        players = {}, -- players in insertion order 
-        players_by_id = {}, -- players in the order of id 
+        players = {},                 -- players in insertion order 
+        players_by_id = {},           -- players in the order of id 
         symbols = {}, 
         turn = nil, 
         status = STATUS_WAITING, 
         winner = nil,
-        turn_deadline_ms = nil, } 
+        turn_deadline_ms = nil,
+        empty_until_ms = nil,         -- when 0 players remain
+        missing_until_ms = nil,       -- when exactly 1 remains during a game
+        missing_player_id = nil, } 
     local tick_rate = 2 
     local label = nk.json_encode({
                         properties = { module = TTT_MATCH_MODULE },
@@ -109,23 +113,49 @@ function M.match_join(context, dispatcher, tick, state, presences)
     for _, presence in ipairs(presences) do 
         if not presence or not presence.user_id then
             nk.logger_warn("Invalid presence during join attempt")
-        end
+        else
+            local uid = presence.user_id
+            -- while rejoining does the player has a reserved seat ? (while leaving symbols were not removed for grace period)
+            local rejoining = state.symbols[uid] ~= nil
 
-        if not state.players_by_id[presence.user_id] then 
-            table.insert(state.players, presence) 
-            state.players_by_id[presence.user_id] = presence 
-        end 
+            if state.players_by_id[uid] then
+                -- already in: ignore duplicate
+            elseif rejoining then
+                -- returning player always allowed during grace
+                table.insert(state.players, presence)
+                state.players_by_id[uid] = presence
+
+                -- clear missing flags if this was the one we waited for
+                if state.missing_player_id == uid then
+                    state.missing_player_id = nil
+                    state.missing_until_ms = nil
+                end
+            else
+                --new player: room must have <2 players
+                if #state.players >=2 then 
+                    broadcast_error(dispatcher, "room full", {presence})
+                else
+                    table.insert(state.players, presence)
+                    state.players_by_id[uid] = presence
+                end
+            end
+        end
     end 
     if #state.players == 2 and state.status == STATUS_WAITING then 
         -- initilize a fresh board and assign symbols based on join order. 
         state.board = {"","","","","","","","",""} 
         local p1 = state.players[1].user_id 
         local p2 = state.players[2].user_id 
-        state.symbols[p1] = "X" 
-        state.symbols[p2] = "O" 
+        if not state.symbols[p1] and not state.symbols[p2] then
+            state.symbols[p1] = "X" 
+            state.symbols[p2] = "O" 
+        end
         state.turn = p1 
         state.status = STATUS_PLAYING
         state.turn_deadline_ms = nk.time() + TURN_MS 
+        state.empty_until_ms = nil
+        state.missing_until_ms = nil
+        state.missing_player_id = nil
     end 
     broadcast_state(dispatcher, state) 
     return state 
@@ -137,6 +167,7 @@ function M.match_leave(context, dispatcher, tick, state, presences)
     for _, presence in ipairs(presences) do 
         leaving[presence.user_id] = true 
     end 
+
     local remaining = {} 
     for _, p in ipairs(state.players) do 
         if not leaving[p.user_id] then 
@@ -144,17 +175,28 @@ function M.match_leave(context, dispatcher, tick, state, presences)
         end 
     end 
     state.players = remaining 
-    if state.status == STATUS_PLAYING and #state.players == 1 then 
-        state.status = STATUS_ENDED 
-        state.winner = state.players[1].user_id
-    elseif #state.players == 0 then 
-        state.status = STATUS_ENDED 
-        state.winner = nil
-    end 
+
     for _, presence in ipairs(presences) do 
         state.players_by_id[presence.user_id] = nil 
-        state.symbols[presence.user_id] = nil 
+        --state.symbols[presence.user_id] = nil 
+    end
+
+    if state.status == STATUS_PLAYING and #state.players == 1 then 
+        -- one player left mid-game: allow the missing player to return for a short time
+        state.missing_until_ms = nk.time() + REJOIN_GRACE_MS
+        -- remember who is missing (the one who is NOT in players now)
+        local remaining_id = state.players[1].user_id
+        state.missing_player_id = other_player_id(state, remaining_id)
+    elseif #state.players == 0 then 
+        -- nobody in the room: allow rejoin for a short time
+        state.empty_until_ms = nk.time() + REJOIN_GRACE_MS
+    else
+        -- back to normal if 2 players in
+        state.missing_until_ms = nil
+        state.missing_player_id = nil
+        state.empty_until_ms = nil
     end 
+     
     if state.status == STATUS_ENDED then
         state.turn = nil
         state.turn_deadline_ms = nil
@@ -226,6 +268,29 @@ local function reset_game(state)
 end
 
 function M.match_loop(context, dispatcher, tick, state, messages) 
+
+    local now = nk.time()
+
+    -- if room is empty, terminate after grace
+    if #state.players == 0 and state.empty_until_ms and now >= state.empty_until_ms then
+        nk.match_terminate(context.match_id)  -- runtime signature in newer servers accepts dispatcher + seconds
+        return state
+    end
+
+    -- if one player is missing during a game, award win after grace
+    if state.status == STATUS_PLAYING and #state.players == 1 and state.missing_until_ms then
+        if now >= state.missing_until_ms then
+        state.status = STATUS_ENDED
+        state.winner = state.players[1].user_id
+        state.turn = nil
+        state.turn_deadline_ms = nil
+        state.missing_until_ms = nil
+        state.missing_player_id = nil
+        broadcast_state(dispatcher, state)
+        return state
+        end
+    end
+
     --enforce timer
     if state.status == STATUS_PLAYING and state.turn and state.turn_deadline_ms then
         if nk.time() >= state.turn_deadline_ms then
